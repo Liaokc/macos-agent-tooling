@@ -1,3 +1,5 @@
 CLAUDE.md
 macos-agent-tooling-BUILDER-TASKS-*.md
 intelligence/macos-agent-tooling-BUILDER-TASKS-*.md
+__pycache__/
+*.pyc
