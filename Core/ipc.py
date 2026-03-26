@@ -11,6 +11,7 @@ Phase 2 Extensions:
 
 import asyncio
 import json
+import os
 import sys
 import uuid
 from typing import AsyncIterator
@@ -204,6 +205,71 @@ def handle_request_sync(cmd: str, args: dict, request_id: str) -> dict:
                 memory_mgr = _get_memory_manager()
                 counts = await memory_mgr.get_counts()
                 return {"ok": True, "data": counts, "request_id": request_id}
+
+            # ── Phase 3: Config ───────────────────────────────────────────────
+
+            elif cmd == "get_config":
+                from config_manager import ConfigManager
+                cm = ConfigManager()
+                return {
+                    "ok": True,
+                    "data": {"config": cm.get().to_dict()},
+                    "request_id": request_id,
+                }
+
+            elif cmd == "update_config":
+                from config_manager import ConfigManager
+                cm = ConfigManager()
+                updated = cm.update(**args)
+                return {
+                    "ok": True,
+                    "data": {"config": updated.to_dict()},
+                    "request_id": request_id,
+                }
+
+            # ── Phase 3: Memory list/delete/clear ──────────────────────────
+
+            elif cmd == "memory_list":
+                memory_mgr = _get_memory_manager()
+                memory_type = args.get("type", None)
+                limit = args.get("limit", 50)
+                offset = args.get("offset", 0)
+                entries = await memory_mgr.list_memories(
+                    memory_type=memory_type, limit=limit, offset=offset
+                )
+                total = await memory_mgr.count_memories(memory_type=memory_type)
+                db_size = os.path.getsize(memory_mgr.db_path) if os.path.exists(memory_mgr.db_path) else 0
+                return {
+                    "ok": True,
+                    "data": {
+                        "entries": [
+                            {
+                                "id": e.id,
+                                "content": e.content,
+                                "memory_type": e.memory_type,
+                                "importance": e.importance,
+                                "created_at": e.created_at,
+                                "metadata": e.metadata,
+                            }
+                            for e in entries
+                        ],
+                        "total": total,
+                        "db_size_bytes": db_size,
+                    },
+                    "request_id": request_id,
+                }
+
+            elif cmd == "memory_delete":
+                memory_mgr = _get_memory_manager()
+                memory_id = args.get("id", "")
+                success = await memory_mgr.delete(memory_id)
+                return {"ok": True, "data": {"deleted": success}, "request_id": request_id}
+
+            elif cmd == "memory_clear":
+                memory_mgr = _get_memory_manager()
+                memory_type = args.get("type", None)
+                count = await memory_mgr.clear(memory_type=memory_type)
+                return {"ok": True, "data": {"cleared": count}, "request_id": request_id}
 
             elif cmd == "agent_execute":
                 # Non-streaming agent execution

@@ -143,5 +143,88 @@ class TestGetCounts:
         assert counts["episodic"] >= 1
 
 
+# ─── Phase 3: list_memories / delete / clear ────────────────────────────────
+
+class TestListMemories:
+    @pytest.mark.asyncio
+    async def test_list_memories_both_types(self, mm):
+        mid1 = await mm.add_semantic_memory("Semantic test entry")
+        mid2 = await mm.add_episodic_memory("Episodic test entry")
+        entries = await mm.list_memories(limit=50)
+        ids = [e.id for e in entries]
+        assert mid1 in ids
+        assert mid2 in ids
+
+    @pytest.mark.asyncio
+    async def test_list_memories_by_type(self, mm):
+        await mm.add_semantic_memory("sem1")
+        await mm.add_episodic_memory("epi1")
+        sem_entries = await mm.list_memories(memory_type="semantic")
+        epi_entries = await mm.list_memories(memory_type="episodic")
+        assert all(e.memory_type == "semantic" for e in sem_entries)
+        assert all(e.memory_type == "episodic" for e in epi_entries)
+
+    @pytest.mark.asyncio
+    async def test_list_memories_pagination(self, mm):
+        for i in range(10):
+            await mm.add_semantic_memory(f"Entry {i}")
+        page1 = await mm.list_memories(limit=5, offset=0)
+        page2 = await mm.list_memories(limit=5, offset=5)
+        ids1 = {e.id for e in page1}
+        ids2 = {e.id for e in page2}
+        assert len(ids1 & ids2) == 0  # no overlap
+
+
+class TestCountMemories:
+    @pytest.mark.asyncio
+    async def test_count_memories_total(self, mm):
+        await mm.add_semantic_memory("s1")
+        await mm.add_episodic_memory("e1")
+        total = await mm.count_memories()
+        assert total >= 2
+
+    @pytest.mark.asyncio
+    async def test_count_memories_by_type(self, mm):
+        await mm.add_semantic_memory("s1")
+        await mm.add_episodic_memory("e1")
+        sem = await mm.count_memories(memory_type="semantic")
+        epi = await mm.count_memories(memory_type="episodic")
+        assert sem >= 1
+        assert epi >= 1
+
+
+class TestDeleteMemory:
+    @pytest.mark.asyncio
+    async def test_delete_memory_success(self, mm):
+        mid = await mm.add_semantic_memory("To be deleted")
+        result = await mm.delete(mid)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_delete_memory_nonexistent(self, mm):
+        result = await mm.delete("nonexistent-id-12345")
+        assert result is False
+
+
+class TestClearMemories:
+    @pytest.mark.asyncio
+    async def test_clear_memories_by_type(self, mm):
+        await mm.add_semantic_memory("semantic to clear")
+        await mm.add_episodic_memory("episodic to keep")
+        cleared = await mm.clear(memory_type="semantic")
+        assert cleared >= 1
+        remaining_sem = await mm.count_memories(memory_type="semantic")
+        assert remaining_sem == 0
+
+    @pytest.mark.asyncio
+    async def test_clear_all_memories(self, mm):
+        await mm.add_semantic_memory("sem1")
+        await mm.add_episodic_memory("epi1")
+        cleared = await mm.clear()
+        assert cleared >= 2
+        total = await mm.count_memories()
+        assert total == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -541,6 +541,245 @@ actor AgentBridge {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // Phase 3: Config
+    // ─────────────────────────────────────────────────────────────
+
+    struct AgentConfig: Codable, Sendable {
+        var model: String
+        var maxIterations: Int
+        var temperature: Float
+        var memorySemanticEnabled: Bool
+        var memoryEpisodicEnabled: Bool
+        var memoryPruneDays: Int
+        var systemPrompt: String?
+        var showThinking: Bool
+        var toolConfirmation: Bool
+        var sandboxWorkspace: String
+
+        enum CodingKeys: String, CodingKey {
+            case model
+            case maxIterations = "max_iterations"
+            case temperature
+            case memorySemanticEnabled = "memory_semantic_enabled"
+            case memoryEpisodicEnabled = "memory_episodic_enabled"
+            case memoryPruneDays = "memory_prune_days"
+            case systemPrompt = "system_prompt"
+            case showThinking = "show_thinking"
+            case toolConfirmation = "tool_confirmation"
+            case sandboxWorkspace = "sandbox_workspace"
+        }
+
+        init(model: String = "llama3", maxIterations: Int = 10, temperature: Float = 0.7,
+             memorySemanticEnabled: Bool = true, memoryEpisodicEnabled: Bool = true,
+             memoryPruneDays: Int = 30, systemPrompt: String? = nil,
+             showThinking: Bool = true, toolConfirmation: Bool = true,
+             sandboxWorkspace: String = "~/.macos-agent-workspace") {
+            self.model = model
+            self.maxIterations = maxIterations
+            self.temperature = temperature
+            self.memorySemanticEnabled = memorySemanticEnabled
+            self.memoryEpisodicEnabled = memoryEpisodicEnabled
+            self.memoryPruneDays = memoryPruneDays
+            self.systemPrompt = systemPrompt
+            self.showThinking = showThinking
+            self.toolConfirmation = toolConfirmation
+            self.sandboxWorkspace = sandboxWorkspace
+        }
+    }
+
+    func getConfig() async throws -> AgentConfig {
+        let resp = try await sendRequest(cmd: "get_config", args: [:])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        guard let data = resp["data"] as? [String: Any],
+              let configDict = data["config"] as? [String: Any],
+              let jsonData = try? JSONSerialization.data(withJSONObject: configDict),
+              let cfg = try? JSONDecoder().decode(AgentConfig.self, from: jsonData) else {
+            throw AgentBridgeError.invalidResponse
+        }
+        return cfg
+    }
+
+    func updateConfig(_ config: AgentConfig) async throws -> AgentConfig {
+        let configDict = try config.toDictionary()
+        let resp = try await sendRequest(cmd: "update_config", args: configDict)
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        guard let data = resp["data"] as? [String: Any],
+              let configDict = data["config"] as? [String: Any],
+              let jsonData = try? JSONSerialization.data(withJSONObject: configDict),
+              let cfg = try? JSONDecoder().decode(AgentConfig.self, from: jsonData) else {
+            throw AgentBridgeError.invalidResponse
+        }
+        return cfg
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 3: Memory list/delete/clear
+    // ─────────────────────────────────────────────────────────────
+
+    struct MemoryListResponse: Codable, Sendable {
+        let entries: [MemoryEntry]
+        let total: Int
+        let dbSizeBytes: Int
+
+        enum CodingKeys: String, CodingKey {
+            case entries, total
+            case dbSizeBytes = "db_size_bytes"
+        }
+    }
+
+    func memoryList(type: String? = nil, limit: Int = 50, offset: Int = 0) async throws -> MemoryListResponse {
+        var args: [String: Any] = ["limit": limit, "offset": offset]
+        if let t = type { args["type"] = t }
+        let resp = try await sendRequest(cmd: "memory_list", args: args)
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        guard let data = resp["data"] as? [String: Any],
+              let jsonData = try? JSONSerialization.data(withJSONObject: data),
+              let result = try? JSONDecoder().decode(MemoryListResponse.self, from: jsonData) else {
+            throw AgentBridgeError.invalidResponse
+        }
+        return result
+    }
+
+    func memoryDelete(id: String) async throws -> Bool {
+        let resp = try await sendRequest(cmd: "memory_delete", args: ["id": id])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        return (resp["data"] as? [String: Any])?["deleted"] as? Bool ?? false
+    }
+
+    func memoryClear(type: String? = nil) async throws -> Int {
+        var args: [String: Any] = [:]
+        if let t = type { args["type"] = t }
+        let resp = try await sendRequest(cmd: "memory_clear", args: args)
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        return (resp["data"] as? [String: Any])?["cleared"] as? Int ?? 0
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 3: Extended AgentStreamEvent
+    // ─────────────────────────────────────────────────────────────
+
+    enum AgentStreamEvent: Sendable {
+        case thinking(text: String)
+        case iterationStart(number: Int)
+        case toolCall(tool: String, args: [String: AnyCodable], callId: String)
+        case toolResult(tool: String, output: String, success: Bool, durationMs: Int)
+        case textChunk(text: String)
+        case done(response: String)
+        case error(message: String)
+    }
+
+    /// Extended agentStream that supports Phase 3 THINKING + ITERATION events.
+    func agentStream(task: String, sessionId: String, model: String = "llama3") -> AsyncThrowingStream<AgentStreamEvent, Error> {
+        AsyncThrowingStream { cont in
+            Task {
+                do {
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                    p.arguments = ["-c",
+                        """
+                        import sys, os, asyncio, json
+                        sys.path.insert(0, os.path.expanduser('~/.openclaw/workspace/macos-agent-tooling/Core'))
+                        from ipc import run_server
+                        asyncio.run(run_server())
+                        """
+                    ]
+
+                    let sin = Pipe()
+                    let sout = Pipe()
+                    p.standardInput = sin
+                    p.standardOutput = sout
+
+                    p.start()
+
+                    let request: [String: Any] = [
+                        "cmd": "_agent_stream",
+                        "args": [
+                            "task": task,
+                            "session_id": sessionId,
+                            "model": model,
+                        ],
+                        "request_id": UUID().uuidString,
+                    ]
+                    let jsonData = try JSONSerialization.data(withJSONObject: request)
+                    sin.fileHandleForWriting.write(jsonData)
+                    sin.fileHandleForWriting.write(Data("\n".utf8))
+                    sin.fileHandleForWriting.closeFile()
+
+                    let handle = sout.fileHandleForReading
+                    while true {
+                        let data = handle.availableData
+                        if data.isEmpty { break }
+                        guard let line = String(data: data, encoding: .utf8) else { continue }
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty,
+                              let lineData = trimmed.data(using: .utf8),
+                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                              let eventStr = json["event"] as? String,
+                              let eventData = json["data"] as? [String: Any] else {
+                            continue
+                        }
+
+                        let streamEvent: AgentStreamEvent?
+                        switch eventStr {
+                        case "thinking":
+                            let text = eventData["text"] as? String ?? ""
+                            streamEvent = .thinking(text: text)
+                        case "iteration":
+                            let number = eventData["number"] as? Int ?? 0
+                            streamEvent = .iterationStart(number: number)
+                        case "tool_call":
+                            let tool = eventData["tool"] as? String ?? ""
+                            let args = (eventData["args"] as? [String: Any]) ?? [:]
+                            let callId = eventData["call_id"] as? String ?? UUID().uuidString
+                            streamEvent = .toolCall(tool: tool, args: args.mapValues { AnyCodable($0) }, callId: callId)
+                        case "tool_result":
+                            let tool = eventData["tool"] as? String ?? ""
+                            let output = eventData["output"] as? String ?? ""
+                            let success = eventData["success"] as? Bool ?? false
+                            let durationMs = eventData["duration_ms"] as? Int ?? 0
+                            streamEvent = .toolResult(tool: tool, output: output, success: success, durationMs: durationMs)
+                        case "text":
+                            let token = eventData["token"] as? String ?? ""
+                            streamEvent = .textChunk(text: token)
+                        case "done":
+                            let response = eventData["response"] as? String ?? ""
+                            streamEvent = .done(response: response)
+                        case "error":
+                            let message = eventData["message"] as? String ?? ""
+                            streamEvent = .error(message: message)
+                        default:
+                            streamEvent = nil
+                        }
+
+                        if let ev = streamEvent {
+                            cont.yield(ev)
+                        }
+
+                        if eventStr == "done" || eventStr == "error" {
+                            break
+                        }
+                    }
+
+                    cont.finish()
+                    p.waitUntilExit()
+                } catch {
+                    cont.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // Phase 2: Agent Executor
     // ─────────────────────────────────────────────────────────────
 
@@ -716,5 +955,16 @@ actor AgentBridge {
                 }
             }
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Encodable → Dictionary helper
+// ─────────────────────────────────────────────────────────────────
+
+extension Encodable {
+    func toDictionary() throws -> [String: Any] {
+        let data = try JSONEncoder().encode(self)
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 }

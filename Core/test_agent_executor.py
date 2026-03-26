@@ -285,6 +285,79 @@ class TestMaxIterations:
         assert "Max iterations" in err.data["message"]
 
 
+# ─── Phase 3: _parse_response ────────────────────────────────────────────────
+
+class TestParseResponse:
+    """Unit tests for _parse_response (Phase 3: THINKING + ITERATION support)."""
+
+    def test_no_tool_calls_entire_text_is_thinking(self, executor):
+        text = "Let me think about this problem step by step."
+        calls, thinking = executor._parse_response(text)
+        assert calls == []
+        assert "think about this" in thinking
+        assert thinking == text
+
+    def test_with_tool_calls_block_exterior_is_thinking(self, executor):
+        text = "I'll run this command:<tool_calls><tool name=\"bash\">{\"command\": \"ls\"}</tool></tool_calls>Let me check the output."
+        calls, thinking = executor._parse_response(text)
+        assert len(calls) == 1
+        assert calls[0]["name"] == "bash"
+        assert "check the output" in thinking
+
+    def test_with_tool_calls_before_block_is_thinking(self, executor):
+        text = "Let me run a command first:<tool_calls><tool name=\"bash\">{\"command\": \"pwd\"}</tool></tool_calls>"
+        calls, thinking = executor._parse_response(text)
+        assert len(calls) == 1
+        assert "run a command first" in thinking
+
+    def test_multiple_tool_calls(self, executor):
+        text = "Explore:<tool_calls><tool name=\"bash\">{\"command\": \"ls\"}</tool><tool name=\"read_file\">{\"path\": \"a.txt\"}</tool></tool_calls>Now I know."
+        calls, thinking = executor._parse_response(text)
+        assert len(calls) == 2
+        assert calls[0]["name"] == "bash"
+        assert calls[1]["name"] == "read_file"
+        assert "Now I know" in thinking
+
+    def test_pure_thinking_no_block(self, executor):
+        text = "First, let me understand the structure."
+        calls, thinking = executor._parse_response(text)
+        assert calls == []
+        assert thinking == text
+
+    def test_empty_text(self, executor):
+        calls, thinking = executor._parse_response("")
+        assert calls == []
+        assert thinking == ""
+
+
+class TestParseToolCallsFromBlock:
+    """Unit tests for _parse_tool_calls_from_block."""
+
+    def test_single_tool(self, executor):
+        block = '<tool name="bash">{"command": "ls"}</tool>'
+        calls = executor._parse_tool_calls_from_block(block)
+        assert len(calls) == 1
+        assert calls[0]["name"] == "bash"
+        assert calls[0]["arguments"] == {"command": "ls"}
+
+    def test_multiple_tools(self, executor):
+        block = '<tool name="bash">{"command": "ls"}</tool><tool name="done">{"message": "done"}</tool>'
+        calls = executor._parse_tool_calls_from_block(block)
+        assert len(calls) == 2
+        assert calls[0]["name"] == "bash"
+        assert calls[1]["name"] == "done"
+
+    def test_non_json_args(self, executor):
+        block = '<tool name="bash">not json</tool>'
+        calls = executor._parse_tool_calls_from_block(block)
+        assert len(calls) == 1
+        assert calls[0]["arguments"] == {"raw": "not json"}
+
+    def test_empty_block(self, executor):
+        calls = executor._parse_tool_calls_from_block("")
+        assert calls == []
+
+
 # ─── AgentConfig ─────────────────────────────────────────────────────────────
 
 class TestAgentConfig:

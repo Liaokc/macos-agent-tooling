@@ -54,6 +54,9 @@ class AgentEventType(Enum):
     TEXT = "text"                # Text token (streaming)
     DONE = "done"                # Agent finished successfully
     ERROR = "error"              # Error occurred
+    # Phase 3
+    THINKING = "thinking"         # Agent reasoning text (user-visible)
+    ITERATION = "iteration"     # New ReAct iteration started
 
 
 @dataclass
@@ -166,6 +169,12 @@ class AgentExecutor:
         while iteration < self.config.max_iterations and not self._stop_requested:
             iteration += 1
 
+            # Phase 3: yield ITERATION event at start of each iteration
+            yield AgentEvent(
+                type=AgentEventType.ITERATION,
+                data={"number": iteration},
+            )
+
             # Build context (apply token budget)
             try:
                 msg_dicts = [
@@ -206,8 +215,15 @@ class AgentExecutor:
                 )
                 return
 
-            # Parse tool calls from response
-            tool_calls = self._parse_tool_calls(response_text)
+            # Phase 3: parse thinking vs tool calls
+            tool_calls, thinking_text = self._parse_response(response_text)
+
+            # Yield THINKING event for visible reasoning
+            if thinking_text:
+                yield AgentEvent(
+                    type=AgentEventType.THINKING,
+                    data={"text": thinking_text},
+                )
 
             if not tool_calls:
                 # No tools → final response, stop
@@ -259,52 +275,65 @@ class AgentExecutor:
 
     # ─── Tool Call Parsing ───────────────────────────────────────────────────
 
-    def _parse_tool_calls(self, text: str) -> list[dict]:
+    def _parse_response(self, text: str) -> tuple[list[dict], str]:
         """
-        Parse <tool_calls>...</tool_calls> blocks from LLM output.
-        Supports: <tool name="bash">{"command": "ls"}</tool>
+        Parse LLM output text.
+        Returns (tool_calls, thinking_text):
+        - tool_calls: parsed tool call list (from <tool_calls> block)
+        - thinking_text: all text outside <tool_calls> blocks (user-visible reasoning)
+        """
+        start = text.find("<tool_calls>")
+        end = text.find("</tool_calls>")
+        if start == -1 or end == -1:
+            return [], text  # No tool_calls — entire text is thinking
+        # Block interior is tool_calls; everything else is thinking
+        before = text[:start].strip()
+        after = text[end + len("</tool_calls>"):].strip()
+        thinking = " ".join(p for p in [before, after] if p)
+        block = text[start:end + len("</tool_calls>"):]
+        tool_calls = self._parse_tool_calls_from_block(block)
+        return tool_calls, thinking
 
-        Returns list of {"name": ..., "arguments": {...}}
+    def _parse_tool_calls_from_block(self, block: str) -> list[dict]:
+        """
+        Parse tool calls from inside a <tool_calls>...</tool_calls> block.
         """
         try:
-            start = text.find("<tool_calls>")
-            end = text.find("</tool_calls>")
-            if start == -1 or end == -1:
-                return []
-
-            block = text[start + len("<tool_calls>"):end].strip()
             calls: list[dict] = []
             pos = 0
-
             while True:
-                # Find next <tool name="...">
                 open_tag = block.find('<tool name="', pos)
                 if open_tag == -1:
                     break
-
                 name_start = open_tag + len('<tool name="')
                 name_end = block.find('"', name_start)
                 tool_name = block[name_start:name_end]
-
-                # Find the closing > of the opening tag
                 args_start = block.find(">", name_end) + 1
                 close_tag = block.find("</tool>", args_start)
                 if close_tag == -1:
                     break
-
                 args_str = block[args_start:close_tag].strip()
                 try:
                     args = json.loads(args_str)
                 except json.JSONDecodeError:
-                    # Fallback: raw string if JSON parse fails
                     args = {"raw": args_str}
-
                 calls.append({"name": tool_name, "arguments": args})
                 pos = close_tag + len("</tool>")
-
             return calls
         except Exception:
             return []
+
+    def _parse_tool_calls(self, text: str) -> list[dict]:
+        """
+        Parse <tool_calls>...</tool_calls> blocks from LLM output.
+        Delegates to _parse_tool_calls_from_block.
+        """
+        start = text.find("<tool_calls>")
+        end = text.find("</tool_calls>")
+        if start == -1 or end == -1:
+            return []
+        block = text[start:end + len("</tool_calls>"):]
+        return self._parse_tool_calls_from_block(block)
 
     # ─── Control ─────────────────────────────────────────────────────────────
 

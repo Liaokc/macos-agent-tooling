@@ -403,6 +403,128 @@ class MemoryManager:
 
         return await asyncio.to_thread(_do)
 
+    # ─── Phase 3: list / delete / clear ──────────────────────────────────────
+
+    async def list_memories(
+        self,
+        memory_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[MemoryEntry]:
+        """List memories in paginated form (ordered by created_at DESC)."""
+        await self._ensure_init()
+
+        def _do() -> list[MemoryEntry]:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if memory_type == "semantic":
+                    rows = conn.execute(
+                        "SELECT id, content, importance, created_at, metadata FROM semantic_memories ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                        (limit, offset),
+                    ).fetchall()
+                elif memory_type == "episodic":
+                    rows = conn.execute(
+                        "SELECT id, content, importance, created_at, metadata FROM episodic_memories ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                        (limit, offset),
+                    ).fetchall()
+                else:
+                    # Merge both tables sorted by created_at DESC
+                    sem = conn.execute(
+                        "SELECT id, content, importance, created_at, metadata FROM semantic_memories",
+                    ).fetchall()
+                    epi = conn.execute(
+                        "SELECT id, content, importance, created_at, metadata FROM episodic_memories",
+                    ).fetchall()
+                    all_rows = sorted(
+                        [(r[0], r[1], "semantic", r[2], r[3], r[4]) for r in sem]
+                        + [(r[0], r[1], "episodic", r[2], r[3], r[4]) for r in epi],
+                        key=lambda r: r[4],
+                        reverse=True,
+                    )
+                    rows = all_rows[offset:offset + limit]
+            finally:
+                conn.close()
+
+            return [
+                MemoryEntry(
+                    id=r[0],
+                    content=r[1],
+                    memory_type=r[2],
+                    session_id=None,
+                    importance=r[3],
+                    created_at=r[4],
+                    metadata=json.loads(r[5]) if isinstance(r[5], str) else (r[5] or {}),
+                )
+                for r in rows
+            ]
+
+        return await asyncio.to_thread(_do)
+
+    async def count_memories(self, memory_type: str | None = None) -> int:
+        """Count memories by type (or total if type is None)."""
+        await self._ensure_init()
+
+        def _do() -> int:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if memory_type == "semantic":
+                    n = conn.execute("SELECT COUNT(*) FROM semantic_memories").fetchone()[0]
+                elif memory_type == "episodic":
+                    n = conn.execute("SELECT COUNT(*) FROM episodic_memories").fetchone()[0]
+                else:
+                    n = (
+                        conn.execute("SELECT COUNT(*) FROM semantic_memories").fetchone()[0]
+                        + conn.execute("SELECT COUNT(*) FROM episodic_memories").fetchone()[0]
+                    )
+            finally:
+                conn.close()
+            return n
+
+        return await asyncio.to_thread(_do)
+
+    async def delete(self, memory_id: str) -> bool:
+        """Delete a memory entry by ID from either semantic or episodic table."""
+        await self._ensure_init()
+
+        def _do() -> bool:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                c1 = conn.execute(
+                    "DELETE FROM semantic_memories WHERE id = ?", (memory_id,)
+                ).rowcount
+                c2 = conn.execute(
+                    "DELETE FROM episodic_memories WHERE id = ?", (memory_id,)
+                ).rowcount
+                conn.commit()
+                return (c1 + c2) > 0
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_do)
+
+    async def clear(self, memory_type: str | None = None) -> int:
+        """Delete all memories of a given type, or all memories if type is None."""
+        await self._ensure_init()
+
+        def _do() -> int:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if memory_type == "semantic":
+                    n = conn.execute("DELETE FROM semantic_memories").rowcount
+                elif memory_type == "episodic":
+                    n = conn.execute("DELETE FROM episodic_memories").rowcount
+                else:
+                    n = (
+                        conn.execute("DELETE FROM semantic_memories").rowcount
+                        + conn.execute("DELETE FROM episodic_memories").rowcount
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return n
+
+        return await asyncio.to_thread(_do)
+
     # ─── Count ────────────────────────────────────────────────────────────────
 
     async def get_counts(self) -> dict[str, int]:
