@@ -1,2 +1,6 @@
 # Core Python dependencies
 httpx>=0.28.0
+
+# Phase 2 dependencies
+sentence-transformers>=3.0.0
+tiktoken>=0.7.0

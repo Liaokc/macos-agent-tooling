@@ -417,6 +417,240 @@ actor AgentBridge {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // Phase 2: Tool Executor
+    // ─────────────────────────────────────────────────────────────
+
+    struct ToolSchema: Codable, Sendable {
+        let name: String
+        let description: String
+        let inputSchema: ToolInputSchema
+
+        enum CodingKeys: String, CodingKey {
+            case name, description
+            case inputSchema = "input_schema"
+        }
+    }
+
+    struct ToolInputSchema: Codable, Sendable {
+        let type: String
+        let properties: [String: ToolProperty]
+        let required: [String]?
+    }
+
+    struct ToolProperty: Codable, Sendable {
+        let type: String
+        let description: String?
+        let `default`: AnyCodable?
+    }
+
+    func getTools() async throws -> [ToolSchema] {
+        let resp = try await sendRequest(cmd: "get_tools")
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        let data = resp["data"] as? [String: Any]
+        let tools = data?["tools"] as? [[String: Any]] ?? []
+        return tools.compactMap { try? JSONSerialization.data(withJSONObject: $0) }
+            .compactMap { try? JSONDecoder().decode(ToolSchema.self, from: $0) }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 2: Memory Manager
+    // ─────────────────────────────────────────────────────────────
+
+    struct MemoryEntry: Codable, Sendable {
+        let id: String
+        let content: String
+        let memoryType: String
+        let sessionId: String?
+        let importance: Float
+        let createdAt: Double
+        let metadata: [String: AnyCodable]
+
+        enum CodingKeys: String, CodingKey {
+            case id, content, importance, metadata
+            case memoryType = "memory_type"
+            case sessionId = "session_id"
+            case createdAt = "created_at"
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            content = try c.decode(String.self, forKey: .content)
+            memoryType = try c.decode(String.self, forKey: .memoryType)
+            sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
+            importance = try c.decode(Float.self, forKey: .importance)
+            createdAt = try c.decode(Double.self, forKey: .createdAt)
+            metadata = (try? c.decode([String: AnyCodable].self, forKey: .metadata)) ?? [:]
+        }
+    }
+
+    struct MemorySearchResult: Codable, Sendable {
+        let entry: MemoryEntry
+        let score: Float
+    }
+
+    func memorySearch(query: String, topK: Int = 5, types: [String]? = nil) async throws -> [MemorySearchResult] {
+        var args: [String: Any] = ["query": query, "top_k": topK]
+        if let types = types {
+            args["types"] = types
+        }
+        let resp = try await sendRequest(cmd: "memory_search", args: args)
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        let data = resp["data"] as? [String: Any]
+        let results = data?["results"] as? [[String: Any]] ?? []
+        return results.compactMap { try? JSONSerialization.data(withJSONObject: $0) }
+            .compactMap { try? JSONDecoder().decode(MemorySearchResult.self, from: $0) }
+    }
+
+    func memoryAdd(content: String, type: String = "semantic", importance: Float = 0.5, sessionId: String? = nil) async throws -> String {
+        var args: [String: Any] = [
+            "content": content,
+            "type": type,
+            "importance": importance,
+        ]
+        if let sid = sessionId {
+            args["session_id"] = sid
+        }
+        let resp = try await sendRequest(cmd: "memory_add", args: args)
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        return (resp["data"] as? [String: Any])?["id"] as? String ?? ""
+    }
+
+    struct MemoryCounts: Codable, Sendable {
+        let episodic: Int
+        let semantic: Int
+    }
+
+    func memoryCounts() async throws -> MemoryCounts {
+        let resp = try await sendRequest(cmd: "memory_counts")
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        guard let data = resp["data"] as? [String: Any],
+              let jsonData = try? JSONSerialization.data(withJSONObject: data),
+              let counts = try? JSONDecoder().decode(MemoryCounts.self, from: jsonData) else {
+            throw AgentBridgeError.invalidResponse
+        }
+        return counts
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 2: Agent Executor
+    // ─────────────────────────────────────────────────────────────
+
+    struct AgentEvent: Codable, Sendable {
+        let type: String   // "tool_call" | "tool_result" | "text" | "done" | "error"
+        let data: [String: AnyCodable]
+
+        enum CodingKeys: String, CodingKey {
+            case type, data
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            type = try c.decode(String.self, forKey: .type)
+            data = (try? c.decode([String: AnyCodable].self, forKey: .data)) ?? [:]
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(type, forKey: .type)
+            try c.encode(data, forKey: .data)
+        }
+    }
+
+    func agentExecute(task: String, sessionId: String, model: String = "llama3") async throws -> String {
+        let resp = try await sendRequest(cmd: "agent_execute", args: [
+            "task": task,
+            "session_id": sessionId,
+            "model": model,
+        ])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        return (resp["data"] as? [String: Any])?["result"] as? String ?? ""
+    }
+
+    /// Stream agent execution events.
+    /// Each yielded element is a JSON-encoded AgentEvent string.
+    func agentStream(task: String, sessionId: String, model: String = "llama3") -> AsyncThrowingStream<AgentEvent, Error> {
+        AsyncThrowingStream { cont in
+            Task {
+                do {
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                    p.arguments = ["-c",
+                        """
+                        import sys, os, asyncio, json
+                        sys.path.insert(0, os.path.expanduser('~/.openclaw/workspace/macos-agent-tooling/Core'))
+                        from ipc import run_server
+                        asyncio.run(run_server())
+                        """
+                    ]
+
+                    let sin = Pipe()
+                    let sout = Pipe()
+                    p.standardInput = sin
+                    p.standardOutput = sout
+
+                    p.start()
+
+                    let request: [String: Any] = [
+                        "cmd": "_agent_stream",
+                        "args": [
+                            "task": task,
+                            "session_id": sessionId,
+                            "model": model,
+                        ],
+                        "request_id": UUID().uuidString,
+                    ]
+                    let jsonData = try JSONSerialization.data(withJSONObject: request)
+                    sin.fileHandleForWriting.write(jsonData)
+                    sin.fileHandleForWriting.write(Data("\n".utf8))
+                    sin.fileHandleForWriting.closeFile()
+
+                    let handle = sout.fileHandleForReading
+                    while true {
+                        let data = handle.availableData
+                        if data.isEmpty { break }
+                        guard let line = String(data: data, encoding: .utf8) else { continue }
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty,
+                              let lineData = trimmed.data(using: .utf8),
+                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                              let eventData = try? JSONSerialization.data(withJSONObject: json),
+                              let event = try? JSONDecoder().decode(AgentEvent.self, from: eventData) else {
+                            continue
+                        }
+
+                        if event.type == "error" {
+                            let msg = (event.data["message"] as? AnyCodable)?.value as? String ?? "unknown"
+                            throw AgentBridgeError.serverError(msg)
+                        }
+
+                        cont.yield(event)
+
+                        if event.type == "done" {
+                            break
+                        }
+                    }
+
+                    cont.finish()
+                    p.waitUntilExit()
+                } catch {
+                    cont.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // Chat (streaming via helper process)
     // ─────────────────────────────────────────────────────────────
 
