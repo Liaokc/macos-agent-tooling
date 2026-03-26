@@ -1,0 +1,2 @@
+# Core Python dependencies
+httpx>=0.28.0

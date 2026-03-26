@@ -1,0 +1,486 @@
+import Foundation
+
+// ─────────────────────────────────────────────────────────────────
+// Shared Models (mirror of Python shared_types.py)
+// ─────────────────────────────────────────────────────────────────
+
+struct ModelInfo: Identifiable, Codable, Sendable {
+    var id: String { name }
+    let name: String
+    let size: Int
+    let modifiedAt: Double
+    let digest: String
+
+    enum CodingKeys: String, CodingKey {
+        case name, size, digest
+        case modifiedAt = "modified_at"
+    }
+}
+
+struct HardwareStats: Codable, Sendable {
+    let cpuPercent: Double
+    let memoryUsed: Int
+    let memoryTotal: Int
+    let memoryPercent: Double
+    let gpuStats: [[String: AnyCodable]]
+
+    enum CodingKeys: String, CodingKey {
+        case cpuPercent = "cpu_percent"
+        case memoryUsed = "memory_used"
+        case memoryTotal = "memory_total"
+        case memoryPercent = "memory_percent"
+        case gpuStats = "gpu_stats"
+    }
+}
+
+struct ChatMessage: Identifiable, Codable, Sendable {
+    let id: String
+    let sessionId: String
+    let role: String
+    let content: String
+    let createdAt: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id, role, content
+        case sessionId = "session_id"
+        case createdAt = "created_at"
+    }
+}
+
+struct SessionInfo: Identifiable, Codable, Sendable {
+    var id: String { _id }
+    let _id: String
+    let title: String
+    let model: String
+    let createdAt: Int
+    let updatedAt: Int
+    let deletedAt: Int?
+    let messageCount: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case _id = "id", title, model
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case deletedAt = "deleted_at"
+        case messageCount = "message_count"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Handle both "id" and "_id" keys
+        if let id = try? c.decode(String.self, forKey: ._id) {
+            self._id = id
+        } else {
+            self._id = try c.decode(String.self, forKey: ._id)
+        }
+        self.title = try c.decode(String.self, forKey: .title)
+        self.model = try c.decode(String.self, forKey: .model)
+        self.createdAt = try c.decode(Int.self, forKey: .createdAt)
+        self.updatedAt = try c.decode(Int.self, forKey: .updatedAt)
+        self.deletedAt = try c.decodeIfPresent(Int.self, forKey: .deletedAt)
+        self.messageCount = try c.decodeIfPresent(Int.self, forKey: .messageCount)
+    }
+}
+
+struct SessionSummary: Identifiable, Codable, Sendable {
+    let id: String
+    let title: String
+    let model: String
+    let createdAt: Int
+    let updatedAt: Int
+    let messageCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, model
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case messageCount = "message_count"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// AnyCodable helper
+// ─────────────────────────────────────────────────────────────────
+
+struct AnyCodable: Codable, Sendable {
+    let value: Any
+
+    init(_ value: Any) { self.value = value }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let i = try? c.decode(Int.self) { value = i }
+        else if let d = try? c.decode(Double.self) { value = d }
+        else if let s = try? c.decode(String.self) { value = s }
+        else if let b = try? c.decode(Bool.self) { value = b }
+        else if let arr = try? c.decode([AnyCodable].self) { value = arr.map(\.value) }
+        else if let dict = try? c.decode([String: AnyCodable].self) { value = dict.mapValues(\.value) }
+        else { value = NSNull() }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        if let i = value as? Int { try c.encode(i) }
+        else if let d = value as? Double { try c.encode(d) }
+        else if let s = value as? String { try c.encode(s) }
+        else if let b = value as? Bool { try c.encode(b) }
+        else { try c.encodeNil() }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// IPC Errors
+// ─────────────────────────────────────────────────────────────────
+
+enum AgentBridgeError: Error, LocalizedError {
+    case processNotRunning
+    case invalidResponse
+    case serverError(String)
+    case timeout
+
+    var errorDescription: String? {
+        switch self {
+        case .processNotRunning: return "Python bridge process is not running"
+        case .invalidResponse: return "Invalid response from bridge"
+        case .serverError(let msg): return "Bridge error: \(msg)"
+        case .timeout: return "Bridge request timed out"
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// AgentBridge — Swift ↔ Python IPC
+// ─────────────────────────────────────────────────────────────────
+
+actor AgentBridge {
+    static let shared = AgentBridge()
+
+    private var process: Process?
+    private var stdin: Pipe?
+    private var stdout: Pipe?
+    private var pendingRequests: [String: CheckedContinuation<Data, Error>] = [:]
+    private var readBuffer = Data()
+    private var isRunning = false
+    private let queue = DispatchQueue(label: "com.cheng-agent.bridge", qos: .userInitiated)
+
+    private let corePath: String
+
+    private init() {
+        // Locate the Python core executable
+        let envPath = FileManager.default.environment["AGENT_TOOLING_CORE_PATH"]
+        self.corePath = envPath ?? Bundle.main.resourcePath.map { "\($0)/../Frameworks/Core/ipc.py" } ?? "ipc.py"
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ─────────────────────────────────────────────────────────────
+
+    func start() throws {
+        guard !isRunning else { return }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = ["-c",
+            """
+            import sys, os
+            sys.path.insert(0, os.path.expanduser('~/.openclaw/workspace/macos-agent-tooling/Core'))
+            from ipc import run_server; run_server()
+            """
+        ]
+
+        let sout = Pipe()
+        let sin = Pipe()
+        p.standardOutput = sout
+        p.standardInput = sin
+
+        stdout = sout
+        stdin = sin
+        process = p
+
+        p.terminationHandler = { [weak self] _ in
+            Task { await self?.handleTermination() }
+        }
+
+        // Read stdout asynchronously
+        sout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                Task { await self?.handleData(data) }
+            }
+        }
+
+        p.start()
+        isRunning = true
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        process?.terminate()
+        stdout?.fileHandleForReading.readabilityHandler = nil
+        stdin = nil
+        stdout = nil
+        process = nil
+        isRunning = false
+    }
+
+    private func handleTermination() {
+        isRunning = false
+        // Cancel all pending requests
+        let conts = pendingRequests.values
+        pendingRequests.removeAll()
+        for c in conts {
+            c.resume(returning: Data())
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Data handling
+    // ─────────────────────────────────────────────────────────────
+
+    private func handleData(_ data: Data) {
+        readBuffer.append(data)
+
+        // Process complete lines
+        while let newlineIndex = readBuffer.firstIndex(of: UInt8(ascii: "\n")) {
+            let lineData = readBuffer[..<newlineIndex]
+            readBuffer = readBuffer[(readBuffer.index(after: newlineIndex))...]
+
+            guard !lineData.isEmpty else { continue }
+
+            // Extract request_id from line to match continuation
+            if let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+               let reqId = json["request_id"] as? String,
+               let cont = pendingRequests.removeValue(forKey: reqId) {
+                cont.resume(returning: lineData)
+            } else if let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                      let reqId = json["request_id"] as? String {
+                // Matched but no pending continuation
+                pendingRequests.removeValue(forKey: reqId)
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Request/Response
+    // ─────────────────────────────────────────────────────────────
+
+    private func sendRequest(cmd: String, args: [String: Any] = [:]) async throws -> [String: Any] {
+        if !isRunning {
+            try start()
+        }
+
+        let requestId = UUID().uuidString
+        let request: [String: Any] = [
+            "cmd": cmd,
+            "args": args,
+            "request_id": requestId
+        ]
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: request),
+              let jsonStr = String(data: jsonData, encoding: .utf8) else {
+            throw AgentBridgeError.invalidResponse
+        }
+
+        return try await withCheckedThrowingContinuation { cont in
+            pendingRequests[requestId] = cont
+            stdin?.fileHandleForWriting.write("\(jsonStr)\n")
+        }.flatMap { data -> [String: Any] in
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw AgentBridgeError.invalidResponse
+            }
+            return json
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Public API
+    // ─────────────────────────────────────────────────────────────
+
+    func ping() async throws -> Bool {
+        let resp = try await sendRequest(cmd: "ping")
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        return (resp["data"] as? [String: Any])?["connected"] as? Bool ?? false
+    }
+
+    func listModels() async throws -> [ModelInfo] {
+        let resp = try await sendRequest(cmd: "list_models")
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        let data = resp["data"] as? [[String: Any]] ?? []
+        return data.compactMap { try? JSONSerialization.data(withJSONObject: $0) }
+            .compactMap { try? JSONDecoder().decode(ModelInfo.self, from: $0) }
+    }
+
+    func pullModel(_ model: String) async throws {
+        let resp = try await sendRequest(cmd: "pull_model", args: ["model": model])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+    }
+
+    func getStats() async throws -> HardwareStats {
+        let resp = try await sendRequest(cmd: "get_stats")
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        guard let data = resp["data"] as? [String: Any],
+              let jsonData = try? JSONSerialization.data(withJSONObject: data),
+              let stats = try? JSONDecoder().decode(HardwareStats.self, from: jsonData) else {
+            throw AgentBridgeError.invalidResponse
+        }
+        return stats
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Session Management
+    // ─────────────────────────────────────────────────────────────
+
+    func createSession(model: String, title: String = "New Chat") async throws -> SessionInfo {
+        let resp = try await sendRequest(cmd: "create_session", args: ["model": model, "title": title])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        guard let data = resp["data"] as? [String: Any],
+              let jsonData = try? JSONSerialization.data(withJSONObject: data),
+              let session = try? JSONDecoder().decode(SessionInfo.self, from: jsonData) else {
+            throw AgentBridgeError.invalidResponse
+        }
+        return session
+    }
+
+    func listSessions() async throws -> [SessionSummary] {
+        let resp = try await sendRequest(cmd: "list_sessions")
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        let data = resp["data"] as? [[String: Any]] ?? []
+        return data.compactMap { try? JSONSerialization.data(withJSONObject: $0) }
+            .compactMap { try? JSONDecoder().decode(SessionSummary.self, from: $0) }
+    }
+
+    func getSession(_ sessionId: String) async throws -> SessionInfo? {
+        let resp = try await sendRequest(cmd: "get_session", args: ["session_id": sessionId])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        guard let data = resp["data"] as? [String: Any],
+              let jsonData = try? JSONSerialization.data(withJSONObject: data ?? [:]),
+              let session = try? JSONDecoder().decode(SessionInfo.self, from: jsonData) else {
+            return nil
+        }
+        return session
+    }
+
+    func getMessages(sessionId: String) async throws -> [ChatMessage] {
+        let resp = try await sendRequest(cmd: "get_messages", args: ["session_id": sessionId])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        let data = resp["data"] as? [[String: Any]] ?? []
+        return data.compactMap { try? JSONSerialization.data(withJSONObject: $0) }
+            .compactMap { try? JSONDecoder().decode(ChatMessage.self, from: $0) }
+    }
+
+    func addMessage(sessionId: String, role: String, content: String) async throws -> ChatMessage {
+        let resp = try await sendRequest(cmd: "add_message", args: [
+            "session_id": sessionId,
+            "role": role,
+            "content": content
+        ])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+        guard let data = resp["data"] as? [String: Any],
+              let jsonData = try? JSONSerialization.data(withJSONObject: data),
+              let msg = try? JSONDecoder().decode(ChatMessage.self, from: jsonData) else {
+            throw AgentBridgeError.invalidResponse
+        }
+        return msg
+    }
+
+    func deleteSession(_ sessionId: String) async throws {
+        let resp = try await sendRequest(cmd: "delete_session", args: ["session_id": sessionId])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+    }
+
+    func updateSessionTitle(sessionId: String, title: String) async throws {
+        let resp = try await sendRequest(cmd: "update_session", args: [
+            "session_id": sessionId,
+            "title": title
+        ])
+        guard resp["ok"] as? Bool == true else {
+            throw AgentBridgeError.serverError(resp["error"] as? String ?? "unknown")
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Chat (streaming via helper process)
+    // ─────────────────────────────────────────────────────────────
+
+    func chatStream(messages: [[String: String]], model: String) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { cont in
+            Task {
+                do {
+                    // Spawn a dedicated subprocess for streaming
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                    p.arguments = ["-c",
+                        """
+                        import sys, os, asyncio, json
+                        sys.path.insert(0, os.path.expanduser('~/.openclaw/workspace/macos-agent-tooling/Core'))
+                        from ipc import run_server
+                        asyncio.run(run_server())
+                        """
+                    ]
+
+                    let sin = Pipe()
+                    let sout = Pipe()
+                    p.standardInput = sin
+                    p.standardOutput = sout
+
+                    p.start()
+
+                    // Send streaming request — use _stream cmd for true streaming
+                    let request: [String: Any] = [
+                        "cmd": "_stream",
+                        "args": ["messages": messages, "model": model],
+                        "request_id": UUID().uuidString
+                    ]
+                    let jsonData = try JSONSerialization.data(withJSONObject: request)
+                    sin.fileHandleForWriting.write(jsonData)
+                    sin.fileHandleForWriting.write(Data("\n".utf8))
+                    sin.fileHandleForWriting.closeFile()
+
+                    // Read response line by line until EOF (Python closes stdout when done)
+                    let handle = sout.fileHandleForReading
+                    while true {
+                        let data = handle.availableData
+                        if data.isEmpty { break }  // EOF reached
+                        guard let line = String(data: data, encoding: .utf8) else { continue }
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty,
+                              let lineData = trimmed.data(using: .utf8),
+                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                            continue
+                        }
+                        if let token = json["token"] as? String {
+                            cont.yield(token)
+                        } else if let err = json["error"] as? String {
+                            throw AgentBridgeError.serverError(err)
+                        } else if json["done"] as? Bool == true {
+                            break  // Stream complete
+                        }
+                    }
+
+                    cont.finish()
+                    p.waitUntilExit()  // Wait for process to fully exit (P0-2 zombie fix)
+                } catch {
+                    cont.finish(throwing: error)
+                }
+            }
+        }
+    }
+}
